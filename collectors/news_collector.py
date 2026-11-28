@@ -5,10 +5,15 @@ import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from database.db import get_connection, create_table
+from database.db import (
+    get_connection,
+    create_table,
+    assign_event,
+    assign_missing_events
+)
 
 
-# Load API key
+# Load API key from .env
 load_dotenv()
 
 API_KEY = os.getenv("GNEWS_API_KEY")
@@ -18,7 +23,7 @@ BASE_URL = "https://gnews.io/api/v4"
 MAX_ARTICLES = 10
 
 
-# Each category has its own collection configuration
+# News collection configurations
 CATEGORIES = {
 
     "International": {
@@ -103,6 +108,7 @@ CATEGORIES = {
 }
 
 
+# Fetch articles from GNews
 def fetch_news(category, config):
 
     endpoint = config["endpoint"]
@@ -147,11 +153,13 @@ def fetch_news(category, config):
         return []
 
 
+# Save articles and assign event IDs
 def save_articles(articles, category):
 
     conn = get_connection()
 
     saved = 0
+    skipped = 0
 
     for article in articles:
 
@@ -160,8 +168,13 @@ def save_articles(articles, category):
         title = article.get("title")
         url = article.get("url")
 
+        # Skip incomplete articles
         if not title or not url:
+
+            skipped += 1
             continue
+
+        fetched_at = datetime.now(timezone.utc).isoformat()
 
         cursor = conn.execute("""
 
@@ -187,54 +200,94 @@ def save_articles(articles, category):
             url,
             article.get("publishedAt"),
             category,
-            datetime.now(timezone.utc).isoformat()
+            fetched_at
 
         ))
 
+        # Process only newly inserted articles
         if cursor.rowcount > 0:
+
+            article_id = cursor.lastrowid
+
             saved += 1
+
+            conn.commit()
+
+            # Group similar articles under the same event
+            event_id = assign_event(article_id)
+
+            print(
+                f"Article saved | Event ID: {event_id}"
+            )
+
+        else:
+
+            # URL already exists
+            skipped += 1
 
     conn.commit()
     conn.close()
 
-    return saved
+    return saved, skipped
 
 
+# Main collection function
 def collect_news():
 
     if not API_KEY:
+
         raise ValueError(
             "GNEWS_API_KEY is missing in .env"
         )
 
+    # Create tables if they do not exist
     create_table()
+
+    print("\n========== DAILY SCOPE ==========")
+
+    print("Processing previously collected articles...\n")
+
+    # Assign event IDs to older articles
+    assign_missing_events()
 
     total_fetched = 0
     total_saved = 0
+    total_skipped = 0
 
-    print("\n========== DAILY SCOPE ==========")
-    print("Starting news collection...\n")
+    print("\nStarting news collection...\n")
 
+    # Collect news category by category
     for category, config in CATEGORIES.items():
 
-        print(f"\nCollecting: {category}")
+        print(f"\n========== {category} ==========")
 
         articles = fetch_news(category, config)
 
-        saved = save_articles(articles, category)
+        saved, skipped = save_articles(
+            articles,
+            category
+        )
 
         total_fetched += len(articles)
+
         total_saved += saved
+
+        total_skipped += skipped
 
         print(f"New articles saved: {saved}")
 
+        print(f"Articles skipped: {skipped}")
+
+    # Final collection summary
     print("\n========== COLLECTION SUMMARY ==========")
 
     print(f"Categories processed: {len(CATEGORIES)}")
 
     print(f"Total articles fetched: {total_fetched}")
 
-    print(f"New unique URLs saved: {total_saved}")
+    print(f"New articles saved: {total_saved}")
+
+    print(f"Articles skipped: {total_skipped}")
 
     print("\nNews collection completed!")
 
